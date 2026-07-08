@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 import json
 import requests
 from pathlib import Path
@@ -13,14 +14,16 @@ TABLE_ID = os.environ.get("FEISHU_TABLE_ID")
 if not all([APP_ID, APP_SECRET, APP_TOKEN, TABLE_ID]):
     raise Exception("缺少必要的环境变量，请检查 GitHub Secrets 配置")
 
-# ================== 路径设置 ==================
+# ================== 路径与状态设置 ==================
 DATA_DIR = Path("资料文件夹")
 DATA_DIR.mkdir(exist_ok=True)
 MANIFEST_PATH = Path("manifest.json")
+LAST_RUN_FILE = Path("last_run_time.txt")
+
+FULL_SYNC = "--full-sync" in sys.argv
 
 # ================== 飞书 API ==================
 def get_tenant_access_token():
-    """获取飞书租户访问令牌"""
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     payload = {"app_id": APP_ID, "app_secret": APP_SECRET}
     resp = requests.post(url, json=payload, timeout=10)
@@ -31,32 +34,47 @@ def get_tenant_access_token():
     return data["tenant_access_token"]
 
 def get_all_records(token):
-    """获取多维表所有记录"""
     url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN}/tables/{TABLE_ID}/records"
     headers = {"Authorization": f"Bearer {token}"}
     all_records = []
     page_token = None
+    page_num = 1
+
+    print(f"🌐 请求飞书 API URL: {url}")
+    
     while True:
         params = {"page_size": 100}
         if page_token:
             params["page_token"] = page_token
+            
+        print(f"📄 正在获取第 {page_num} 页数据...")
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
+        
         data = resp.json()
+        print(f"🔍 飞书原始返回（第 {page_num} 页）: {json.dumps(data, ensure_ascii=False)}")
+
         if data.get("code") != 0:
-            print(f"❌ API 返回错误: {data}")
+            print(f"❌ 飞书 API 报错，错误码: {data.get('code')}，信息: {data}")
             break
+
         records = data.get("data", {}).get("items")
         if records is None:
+            print("⚠️ API 返回中未找到 'items' 字段，请检查 APP_TOKEN 或 TABLE_ID 是否正确！")
             break
+
+        print(f"📊 本页获取到 {len(records)} 条记录")
         all_records.extend(records)
+
         page_token = data.get("data", {}).get("page_token")
         if not page_token:
+            print("✅ 所有分页读取完毕")
             break
+        page_num += 1
+
     return all_records
 
 def download_file(url, save_path, token):
-    """下载飞书附件"""
     headers = {"Authorization": f"Bearer {token}"}
     try:
         resp = requests.get(url, headers=headers, stream=True, timeout=30)
@@ -74,25 +92,27 @@ def download_file(url, save_path, token):
         return False
 
 def sync_from_feishu():
-    """主同步函数"""
     print("🔄 开始同步飞书数据...")
+    if FULL_SYNC:
+        print("▶️ 检测到 --full-sync 参数，强制全量同步并覆盖")
+    else:
+        if LAST_RUN_FILE.exists():
+            print(f"⏱️ 增量模式，上次同步时间为: {LAST_RUN_FILE.read_text().strip()}")
+        else:
+            print("⏱️ 首次运行，触发全量同步")
     
-    # 获取 token
     token = get_tenant_access_token()
-    
-    # 获取所有记录
     records = get_all_records(token)
+    
     if not records:
-        print("⚠️ 没有获取到记录。")
+        print("⚠️ 没有获取到任何记录。")
+        print("💡 排查提示：如果飞书返回的是空列表 []，请务必去飞书表格 -> 右上角 ... -> 权限管理 -> 添加本应用的 APP_ID 作为协作者！")
         return
-    print(f"📊 获取到 {len(records)} 条记录")
+    print(f"📦 总获取到 {len(records)} 条记录")
 
     synced_count = 0
-    
     for record in records:
         fields = record.get("fields", {})
-        
-        # 1. 提取【姓名】字段 (根据截图为 "姓名")
         name = fields.get("姓名")
         if not name:
             print(f"⚠️ 跳过未命名的记录 (无姓名) - ID: {record.get('record_id')}")
@@ -101,19 +121,55 @@ def sync_from_feishu():
         person_dir = DATA_DIR / name
         person_dir.mkdir(exist_ok=True)
         has_new_file = False
+        
+        # ====== ✨ 优化：自动识别文本字段并生成首行标题 ======
+        # 1. 模糊匹配可能存在的字段名
+        text_content = None
+        possible_keys = ["文本", "文字资料", "文本资料"]
+        for key in possible_keys:
+            if fields.get(key) and isinstance(fields.get(key), str):
+                text_content = fields.get(key)
+                break  # 找到第一个非空字符串就跳出循环
+        
+        # 2. 如果找到了文本内容，开始处理
+        if text_content:
+            txt_filename = "简介.txt"
+            save_path = person_dir / txt_filename
+            
+            if not save_path.exists() or FULL_SYNC:
+                print(f"📄 保存文本资料: {name}/{txt_filename}")
+                
+                # 3. 分离首行作为标题，剩余作为正文
+                lines = text_content.split('\n')
+                if len(lines) > 1:
+                    title = lines[0].strip()  # 第一行作为标题
+                    body = '\n'.join(lines[1:]).strip()  # 剩余行作为正文
+                    # 组装成整洁的格式：标题居中，下方留空一行再接正文
+                    formatted_text = f"========== {title} ==========\n\n{body}"
+                else:
+                    # 如果只有一行字，就直接当纯文本
+                    formatted_text = text_content
 
-        # 2. 处理【图片音视频】附件
+                # 4. 使用 utf-8 写入 txt 文件
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(formatted_text)
+                
+                has_new_file = True
+            else:
+                print(f"   ⏭️ 简介已存在，跳过: {name}/{txt_filename}")
+        # ====== ✨ 结束文本优化逻辑 ======
+
+        # 处理【图片音视频】附件
         media_field = fields.get("图片音视频")
         if media_field and isinstance(media_field, list):
             for media in media_field:
-                filename = media.get("name", "media.jpg")
+                filename = media.get("name", "media.jpg").replace('\n', '').replace('\r', '').replace('\t', '').strip()
                 download_url = media.get("url")
                 if not download_url:
                     print(f"   ⚠️ 媒体文件无 URL: {filename}")
                     continue
                 save_path = person_dir / filename
-                if save_path.exists():
-                    print(f"   ⏭️ 文件已存在: {filename}")
+                if save_path.exists() and not FULL_SYNC:
                     continue
                 if download_file(download_url, save_path, token):
                     print(f"✅ 图片/视频: {name}/{filename}")
@@ -121,29 +177,10 @@ def sync_from_feishu():
                 else:
                     print(f"❌ 媒体下载失败: {name}/{filename}")
 
-        # 3. 处理【文本资料】附件 (根据截图为 "文本资料")
-        text_field = fields.get("文本资料")
-        if text_field and isinstance(text_field, list):
-            for text_att in text_field:
-                filename = text_att.get("name", "文章.txt")
-                download_url = text_att.get("url")
-                if not download_url:
-                    print(f"   ⚠️ 文本资料无 URL: {filename}")
-                    continue
-                save_path = person_dir / filename
-                if save_path.exists():
-                    print(f"   ⏭️ 文件已存在: {filename}")
-                    continue
-                if download_file(download_url, save_path, token):
-                    print(f"✅ 文本资料: {name}/{filename}")
-                    has_new_file = True
-                else:
-                    print(f"❌ 文本资料下载失败: {name}/{filename}")
-
         if has_new_file:
             synced_count += 1
 
-    # ===== 生成 manifest.json =====
+    # 4. 生成 manifest.json
     print("📋 正在生成 manifest.json ...")
     manifest = {}
     for person_dir in DATA_DIR.iterdir():
@@ -153,6 +190,9 @@ def sync_from_feishu():
                 manifest[person_dir.name] = files
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+    
+    import time
+    LAST_RUN_FILE.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
     
     print(f"✅ manifest.json 已生成，共 {len(manifest)} 人")
     print(f"🎉 同步完成：{synced_count} 人新增或更新了资料")
